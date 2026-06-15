@@ -1,4 +1,5 @@
 import { Context, Effect, Layer } from "effect"
+import { readFileSync } from "node:fs"
 
 import { InstanceState } from "@/effect/instance-state"
 
@@ -17,6 +18,18 @@ import { Permission } from "@/permission"
 import { Skill } from "@/skill"
 
 export function provider(model: Provider.Model) {
+  // Launcher knob: OPENCODE_SYSTEM_PROMPT_FILE=<abs path> overrides ALL model-id
+  // routing below and uses the file's contents verbatim as the system prompt.
+  // Fail loud (don't silently fall back) so a bad path can't quietly poison an
+  // ablation arm. Threaded in by the sharded spinup script per shard env.
+  const override = process.env.OPENCODE_SYSTEM_PROMPT_FILE
+  if (override) {
+    try {
+      return [readFileSync(override, "utf8")]
+    } catch (e) {
+      throw new Error(`OPENCODE_SYSTEM_PROMPT_FILE set but unreadable: ${override} (${e})`)
+    }
+  }
   if (model.api.id.includes("gpt-4") || model.api.id.includes("o1") || model.api.id.includes("o3"))
     return [PROMPT_BEAST]
   if (model.api.id.includes("gpt")) {
