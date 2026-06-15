@@ -351,6 +351,12 @@ export const layer = Layer.effect(
       auto: boolean
       overflow?: boolean
     }) {
+      // [COMPACTION_DEBUG] confirms compaction is actually executing (summarization step).
+      log.info("[COMPACTION_DEBUG] compaction.process running", {
+        sessionID: input.sessionID,
+        auto: input.auto,
+        overflow: input.overflow ?? null,
+      })
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
         throw new Error(`Compaction parent must be a user message: ${input.parentID}`)

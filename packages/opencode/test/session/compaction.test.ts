@@ -35,7 +35,7 @@ import { LLMEvent, Usage } from "@opencode-ai/llm"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 
-void Log.init({ print: false })
+void Log.init({ print: true, level: "DEBUG" })
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -933,7 +933,7 @@ describe("session.compaction.process", () => {
         metadata: { compaction_continue: true },
       })
       if (last?.parts[0]?.type === "text") {
-        expect(last.parts[0].text).toContain("Continue if you have next steps")
+        expect(last.parts[0].text).toContain("Continue with the next steps.")
       }
     }),
   )

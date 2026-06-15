@@ -4,8 +4,10 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import type { MessageV2 } from "./message-v2"
+import { Log } from "@opencode-ai/core/util/log"
 
 const COMPACTION_BUFFER = 20_000
+const log = Log.create({ service: "session.overflow" })
 
 export function usable(input: { cfg: ConfigV1.Info; model: Provider.Model; outputTokenMax?: number }) {
   const context = input.model.limit.context
@@ -30,5 +32,17 @@ export function isOverflow(input: {
 
   const count =
     input.tokens.total || input.tokens.input + input.tokens.output + input.tokens.cache.read + input.tokens.cache.write
-  return count >= usable(input)
+  const threshold = usable(input)
+  const triggered = count >= threshold
+  // [COMPACTION_DEBUG] verify limit.input is honored and see when compaction fires.
+  // threshold should equal (limit.input - reserved); e.g. input=50000, reserved=20000 -> 30000.
+  log.info("[COMPACTION_DEBUG] overflow check", {
+    count,
+    threshold,
+    limitInput: input.model.limit.input ?? null,
+    limitContext: input.model.limit.context,
+    reserved: input.cfg.compaction?.reserved ?? null,
+    triggered,
+  })
+  return triggered
 }
