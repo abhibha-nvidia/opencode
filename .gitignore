@@ -25,6 +25,12 @@ a.out
 target
 .scripts
 .direnv/
+node/
+opencode_scripts/runs/
+opencode_scripts/analysis/
+opencode_scripts/analysis_scripts/__pycache__/
+mcp/
+bun/
 
 # Local dev files
 opencode-dev

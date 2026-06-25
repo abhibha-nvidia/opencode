@@ -116,6 +116,75 @@ def export_trajectory(db_path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Unified multi-session export (main agent + every subagent)
+# ---------------------------------------------------------------------------
+# Same {session, messages} shape as TRAJ_SQL but for ONE session id, so the format
+# is identical to the legacy export -- just selected per-session instead of "newest".
+SESSION_SQL = """
+SELECT json_object(
+  'session', json_object(
+    'id', s.id, 'slug', s.slug, 'directory', s.directory, 'title', s.title,
+    'version', s.version, 'agent', s.agent, 'model', s.model, 'cost', s.cost,
+    'tokens_input', s.tokens_input, 'tokens_output', s.tokens_output,
+    'tokens_reasoning', s.tokens_reasoning,
+    'time_created', s.time_created, 'time_updated', s.time_updated),
+  'messages', (
+    SELECT json_group_array(json_set(m.data, '$.parts',
+      (SELECT json_group_array(json(p.data))
+         FROM (SELECT data FROM part WHERE message_id = m.id ORDER BY time_created) p)))
+    FROM (SELECT id, data FROM message WHERE session_id = s.id ORDER BY time_created) m))
+FROM session s WHERE s.id = ?;
+""".strip()
+
+
+def _wjson(obj, path: Path) -> None:
+    """Write pretty JSON, tolerating lone surrogates stored by opencode."""
+    with open(path, "w", encoding="utf-8", errors="surrogatepass") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def export_all_sessions(db_path: Path):
+    """Return (root_export, subagents, tree). root_export is the {session,messages}
+    dict for the ROOT (parent_id IS NULL, earliest) session -- the MAIN agent thread,
+    fixing the legacy 'newest session' (DESC LIMIT 1) bug. subagents is a list of
+    (parent_id, session_id, agent, {session,messages}) for every non-root session.
+    tree is a per-session manifest. Returns ({}, [], []) on failure."""
+    if not db_path.is_file():
+        return {}, [], []
+    try:
+        con = sqlite3.connect(str(db_path))
+        sessions = con.execute(
+            "SELECT id, parent_id, agent, time_created FROM session ORDER BY time_created"
+        ).fetchall()
+        if not sessions:
+            con.close()
+            return {}, [], []
+
+        def export_one(sid):
+            row = con.execute(SESSION_SQL, (sid,)).fetchone()
+            return json.loads(row[0]) if row and row[0] else {"session": None, "messages": []}
+
+        roots = [s for s in sessions if not s[1]]
+        root = sorted(roots, key=lambda s: s[3])[0] if roots else sorted(sessions, key=lambda s: s[3])[0]
+        root_id = root[0]
+        root_export = export_one(root_id)
+
+        subagents = []
+        tree = []
+        for sid, parent_id, agent, t in sessions:
+            mc = con.execute("SELECT COUNT(*) FROM message WHERE session_id=?", (sid,)).fetchone()[0]
+            tree.append({"session_id": sid, "parent_id": parent_id, "agent": agent,
+                         "time_created": t, "messages": mc, "is_root": (sid == root_id)})
+            if sid != root_id:
+                subagents.append((parent_id, sid, agent, export_one(sid)))
+        con.close()
+        return root_export, subagents, tree
+    except Exception as e:
+        log.warning("multi-session export failed: %s", e)
+        return {}, [], []
+
+
+# ---------------------------------------------------------------------------
 # Per-question runner
 # ---------------------------------------------------------------------------
 
@@ -183,7 +252,23 @@ def run_one(idx: int, record: dict, args: argparse.Namespace,
     db_dir = xdg / "opencode"
     db_path = next((db_dir / n for n in ("opencode-local.db", "opencode.db")
                     if (db_dir / n).is_file()), db_dir / "opencode.db")
-    raw = export_trajectory(db_path)
+    # UNIFIED export: pull EVERY session (root + subagents), not just the newest.
+    root_export, subagents, tree = export_all_sessions(db_path)
+    raw = root_export  # the ROOT/main session drives completeness + collation
+
+    # Human-readable RAW transcript with discard-all boundaries marked inline
+    # (prefix -> tool calls -> DISCARD ALL [last-k retained] -> ... -> next discard).
+    # Written per-sample regardless of completion; best-effort.
+    try:
+        if db_path.is_file():
+            render_py = Path(__file__).parent / "render_discard_trajectory.py"
+            render_out = work_dir / "discard_snapshots" / "trajectory_rendered.txt"
+            render_out.parent.mkdir(parents=True, exist_ok=True)
+            with open(render_out, "w") as rf:
+                subprocess.run([sys.executable, str(render_py), str(db_path), "--max-chars", "400"],
+                               stdout=rf, stderr=subprocess.STDOUT, timeout=120)
+    except Exception as e:
+        log.warning("[shard %s] q%05d: trajectory render failed: %s", shard_id, idx, e)
 
     msgs = raw.get("messages")
     complete = raw.get("session") is not None and isinstance(msgs, list) and len(msgs) > 0
@@ -205,6 +290,28 @@ def run_one(idx: int, record: dict, args: argparse.Namespace,
         log.info("[shard %s] q%05d done", shard_id, idx)
         if run_trajectories:
             append_to_trajectories(traj_path, run_trajectories)
+        # UNIFIED FORMAT: write the per-sample folder (root + subagents + tree)
+        # under <run-dir>/complete_trajectories/sample_<id>/. Friendly to both
+        # agent and subagent traces; root trajectory.json == the main thread.
+        try:
+            if args.run_dir:
+                sid = record.get("_sample_id", idx)
+                folder = Path(args.run_dir) / "complete_trajectories" / f"sample_{sid}"
+                folder.mkdir(parents=True, exist_ok=True)
+                _wjson(wrapped, folder / "trajectory.json")
+                if subagents:
+                    subdir = folder / "subagents"
+                    subdir.mkdir(exist_ok=True)
+                    for parent_id, sess_id, agent, exp in subagents:
+                        _wjson({"sample_id": sid, "shard_id": shard_id,
+                                "parent_session_id": parent_id, "agent": agent,
+                                "session": exp.get("session"), "messages": exp.get("messages")},
+                               subdir / f"{parent_id}__{sess_id}.json")
+                _wjson({"sample_id": sid, "shard_id": shard_id,
+                        "num_sessions": len(tree), "sessions": tree},
+                       folder / "tree.json")
+        except Exception as e:
+            log.warning("[shard %s] q%05d: unified-format write failed: %s", shard_id, idx, e)
         return True
     else:
         tmp.unlink(missing_ok=True)
